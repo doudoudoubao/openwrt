@@ -11,9 +11,20 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
 ## 一分钟上手
 
 1. Fork 或直接使用本仓库
-2. 仓库页面 → **Actions** → 左侧 **构建旁路由固件** → **Run workflow**
+2. 触发构建，两种方式任选：
+   - **网页点按钮**：仓库页面 → **Actions** → 左侧 **构建旁路由固件** → **Run workflow**
+     （需要 workflow 文件已在默认分支上，否则 Actions 里看不到它）
+   - **推标签**：任何分支上都能用，不依赖默认分支
+
+     ```bash
+     git tag build-$(date +%Y%m%d) && git push origin build-$(date +%Y%m%d)
+     ```
 3. 等 1.5～3 小时（第一次最慢，工具链要从头编）
 4. 从 **Artifacts** 或 **Releases** 下载固件
+
+> 为什么要有标签这条路：GitHub 的 `workflow_dispatch` 只认默认分支上的 workflow 文件，
+> 分支上的它压根不显示。而 `push` 事件用的是被推送 ref 自带的 workflow，所以在分支合进
+> main 之前，推标签是唯一跑得起来的触发方式。合并之后两种都能用。
 
 | 想要什么 | 下载哪个文件 |
 | --- | --- |
