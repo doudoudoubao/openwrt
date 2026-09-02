@@ -29,6 +29,12 @@ on:
   push:
     tags:
       - 'build-*'
+    # 分支形式的等价触发。有些环境的令牌只允许推送分支、不允许推送 tag ref
+    # （推 tag 会收到 GitHub 的 403），这时用分支名触发：
+    #     git push origin HEAD:refs/heads/build/20260902
+    branches:
+      - 'build/**'
+      - 'claude/build-*'
 
   # 想让它每周自动出一版新固件，就把下面三行的注释去掉
   # schedule:
@@ -171,7 +177,7 @@ jobs:
           retention-days: 30
 
       - name: 发布 Release
-        if: steps.compile.outputs.status == 'success' && (inputs.create_release || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/build-'))
+        if: steps.compile.outputs.status == 'success' && (inputs.create_release || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/build-') || startsWith(github.ref, 'refs/heads/build/') || startsWith(github.ref, 'refs/heads/claude/build-'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
