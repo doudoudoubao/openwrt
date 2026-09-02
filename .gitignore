@@ -1,0 +1,12 @@
+# 构建时创建的源码软链接
+/openwrt
+# 本地试编译产生的东西
+/bin/
+/build_dir/
+/staging_dir/
+/dl/
+/logs/
+/tmp/
+.config
+.config.old
+*.log

@@ -1,0 +1,229 @@
+name: 构建旁路由固件
+
+# 手动触发：仓库页面 -> Actions -> 构建旁路由固件 -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      config_file:
+        description: '种子配置文件路径'
+        required: true
+        default: 'configs/x86_64.config'
+        type: string
+      use_upstream_passwall:
+        description: '用上游最新 PassWall（更新快，但偶尔编译打架）'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: '编译完成后发布到 Release'
+        required: false
+        default: true
+        type: boolean
+
+  # 想让它每周自动出一版新固件，就把下面三行的注释去掉
+  # schedule:
+  #   - cron: '0 20 * * 5'   # 每周六 04:00 (北京时间)
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-24.10
+  CONFIG_FILE: ${{ inputs.config_file || 'configs/x86_64.config' }}
+  USE_UPSTREAM_PASSWALL: ${{ inputs.use_upstream_passwall && '1' || '0' }}
+  TZ: Asia/Shanghai
+
+# 同一时刻只跑一个构建，避免把 Actions 额度烧光
+concurrency:
+  group: build-openwrt
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          echo "清理前："
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get -y purge -qq \
+              azure-cli* google-cloud* powershell* mongodb-* mysql-* \
+              firefox* dotnet-* temurin-* microsoft-edge* 2>/dev/null || true
+          sudo apt-get -y autoremove --purge -qq || true
+          sudo apt-get clean
+          sudo docker image prune -a -f >/dev/null 2>&1 || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          echo "清理后："
+          df -h / /mnt
+
+      - name: 安装编译依赖
+        run: |
+          sudo -E apt-get -qq update
+          DEPS=$(sed 's/#.*//' "$GITHUB_WORKSPACE/scripts/depends-ubuntu.txt" | xargs)
+          # 先整批装；某个包在这个 runner 上不存在会让整批失败，那就逐个装、跳过缺的
+          if ! sudo -E apt-get -y -qq install $DEPS; then
+            echo "整批安装失败，改为逐个安装"
+            for p in $DEPS; do
+              sudo -E apt-get -y -qq install "$p" || echo "  跳过不存在的包: $p"
+            done
+          fi
+          sudo -E systemd-detect-virt >/dev/null 2>&1 || true
+          sudo timedatectl set-timezone "$TZ" || true
+
+      - name: 准备构建目录
+        run: |
+          # 构建放在 /mnt，那里的可用空间比 / 大得多
+          sudo mkdir -p /mnt/workdir
+          sudo chown "$USER":"$(id -gn)" /mnt/workdir
+          echo "WORKDIR=/mnt/workdir" >> "$GITHUB_ENV"
+
+      - name: 拉取 ImmortalWrt 源码
+        run: |
+          for i in 1 2 3 4; do
+            if git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$WORKDIR/openwrt"; then
+              break
+            fi
+            echo "克隆失败，${i} 次重试后等待 $((2 ** i))s"
+            rm -rf "$WORKDIR/openwrt"
+            sleep $((2 ** i))
+          done
+          [ -d "$WORKDIR/openwrt" ] || { echo "::error::源码克隆失败"; exit 1; }
+          ln -sf "$WORKDIR/openwrt" "$GITHUB_WORKSPACE/openwrt"
+          cd "$WORKDIR/openwrt"
+          echo "源码版本: $(git log -1 --format='%h %s')"
+
+      - name: 载入自定义 feeds (diy-part1)
+        working-directory: /mnt/workdir/openwrt
+        run: $GITHUB_WORKSPACE/scripts/diy-part1.sh
+
+      - name: 更新并安装 feeds
+        working-directory: /mnt/workdir/openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 载入配置与定制文件 (diy-part2)
+        working-directory: /mnt/workdir/openwrt
+        run: |
+          cp -f "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          cp -rf "$GITHUB_WORKSPACE/files" ./files
+          # uci-defaults 脚本必须可执行
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          $GITHUB_WORKSPACE/scripts/diy-part2.sh
+          make defconfig
+
+      - name: 核对配置（列出被丢弃的包）
+        working-directory: /mnt/workdir/openwrt
+        run: $GITHUB_WORKSPACE/scripts/check-config.sh "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+
+      - name: 下载源码包
+        working-directory: /mnt/workdir/openwrt
+        run: |
+          make download -j8 || make download -j1
+          # 清掉下载不完整的文件，否则编译到一半才报错
+          find dl -size -1024c -exec rm -f {} \; 2>/dev/null || true
+
+      - name: 编译固件
+        id: compile
+        working-directory: /mnt/workdir/openwrt
+        run: |
+          echo "使用 $(nproc) 线程编译"
+          # 并行失败多半是依赖顺序问题，退回单线程；再失败就开 V=s 打详细日志
+          make -j"$(nproc)" || make -j1 || make -j1 V=s
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "DEVICE_NAME=$(grep '^CONFIG_TARGET_BOARD' .config | cut -d'"' -f2)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
+
+      - name: 整理固件文件
+        if: steps.compile.outputs.status == 'success'
+        run: |
+          cd "$WORKDIR/openwrt/bin/targets"/*/*
+          rm -rf packages feeds.buildinfo version.buildinfo
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo "产物清单："
+          ls -lh
+
+      - name: 上传固件到 Artifacts
+        if: steps.compile.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ByPassWrt-${{ env.DEVICE_NAME }}-${{ env.BUILD_DATE }}
+          path: ${{ env.FIRMWARE }}
+          retention-days: 30
+
+      - name: 发布 Release
+        if: steps.compile.outputs.status == 'success' && (inputs.create_release || github.event_name == 'schedule')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${BUILD_DATE}"
+          cat > /tmp/release-notes.md <<'NOTES'
+          ## 旁路由定制固件
+
+          | 项目 | 值 |
+          | --- | --- |
+          | 管理地址 | http://192.168.1.2 |
+          | 用户名 | `root` |
+          | 密码 | **空**（首次登录后请立刻设置） |
+          | 网关 | 192.168.1.1（主路由） |
+          | DHCP | 已关闭（由主路由下发） |
+
+          ### 选哪个文件
+          - **物理机 / U 盘启动**：`*-squashfs-combined-efi.img.gz`（新机器，UEFI）
+            或 `*-squashfs-combined.img.gz`（老机器，Legacy BIOS）
+          - **PVE / ESXi / VirtualBox**：`*.vmdk`
+          - 想以后扩容分区、装 Docker，选 `ext4` 版；想保留恢复出厂设置，选 `squashfs` 版
+
+          ### 刷完之后
+          1. 电脑网口直连软路由，手动设 IP `192.168.1.100/24`，浏览器打开 http://192.168.1.2
+          2. 先改 root 密码
+          3. 「服务 → PassWall」里加节点，然后才勾选「启用」
+          4. 客户端把网关和 DNS 都改成 `192.168.1.2` 即可走旁路由
+
+          NOTES
+
+          # 文档链接要展开变量，所以放在带引号的 heredoc 外面单独追加
+          {
+            echo ""
+            echo "完整说明见 [docs/旁路由部署指南.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/%E6%97%81%E8%B7%AF%E7%94%B1%E9%83%A8%E7%BD%B2%E6%8C%87%E5%8D%97.md)"
+          } >> /tmp/release-notes.md
+
+          cd "$FIRMWARE"
+          # 只上传普通文件，目录会让 gh 直接报错
+          mapfile -t ASSETS < <(find . -maxdepth 1 -type f -printf '%p\n')
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::固件目录里没有任何文件"; exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ByPassWrt ${BUILD_DATE}" \
+            --notes-file /tmp/release-notes.md \
+            "${ASSETS[@]}" || {
+              echo "::warning::Release 创建失败，固件仍可从 Artifacts 下载"
+              exit 0
+            }
+
+      - name: 编译失败时收集日志
+        if: failure()
+        run: |
+          mkdir -p /tmp/logs
+          cp -r "$WORKDIR/openwrt/logs" /tmp/logs/build-logs 2>/dev/null || true
+          cp "$WORKDIR/openwrt/.config" /tmp/logs/ 2>/dev/null || true
+          echo "磁盘使用："; df -h
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}
+          path: /tmp/logs
+          retention-days: 7
+          if-no-files-found: ignore

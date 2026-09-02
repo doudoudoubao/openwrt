@@ -1,0 +1,290 @@
+#!/bin/sh
+#
+# 旁路由（单臂路由）一键配置
+# 首次启动时自动执行一次，成功后本文件会被系统自动删除。
+# 执行日志：/tmp/bypass-setup.log
+#
+# ===========================================================================
+#  用户可修改区 —— 改完重新编译即可；已刷机的也可直接改 /etc/config/* 生效
+# ===========================================================================
+LAN_IP="192.168.1.2"           # 旁路由自己的 IP（与主路由同网段，且不能冲突）
+LAN_NETMASK="255.255.255.0"
+MAIN_ROUTER="192.168.1.1"      # 主路由 IP，也就是旁路由的网关和出口
+HOSTNAME="ByPassWrt"           # 主机名
+SERVE_DHCP="0"                 # 0=主路由发 DHCP（默认，最安全）
+                               # 1=旁路由接管 DHCP，自动把客户端网关/DNS 指向自己
+                               #   （改 1 前务必先关掉主路由的 DHCP，否则两个 DHCP 打架）
+DHCP_START="100"               # SERVE_DHCP=1 时的地址池起始
+DHCP_LIMIT="150"               # SERVE_DHCP=1 时的地址池大小
+# ===========================================================================
+
+exec >>/tmp/bypass-setup.log 2>&1
+log() { echo "[bypass-setup $(date '+%F %T')] $*"; }
+log "开始配置旁路由：LAN_IP=$LAN_IP GATEWAY=$MAIN_ROUTER SERVE_DHCP=$SERVE_DHCP"
+
+# ---------------------------------------------------------------------------
+# 1. 网络：把所有物理网口并进 br-lan，删掉 WAN，做成单臂旁路由
+# ---------------------------------------------------------------------------
+# 旁路由只有一条腿：所有网口都在同一个桥里，插哪个口都能用。
+BR_SEC="$(uci -q show network | grep -m1 "\.name='br-lan'" | cut -d. -f1-2)"
+if [ -n "$BR_SEC" ]; then
+	uci -q delete "${BR_SEC}.ports"
+	for nic in $(ls /sys/class/net 2>/dev/null); do
+		# 跳过虚拟接口，只要真实网卡
+		case "$nic" in
+			lo|br-*|wlan*|docker*|veth*|tun*|tap*|sit*|ifb*|teql*|gre*|ip6*|bond*|dummy*|tailscale*|zt*) continue ;;
+		esac
+		[ -e "/sys/class/net/$nic/device" ] || continue   # 无 device 节点 = 虚拟设备
+		[ -d "/sys/class/net/$nic/wireless" ] && continue  # 无线口不进有线桥
+		log "加入 br-lan: $nic"
+		uci add_list "${BR_SEC}.ports=$nic"
+	done
+else
+	log "警告：未找到 br-lan 设备段，跳过网口归并"
+fi
+
+uci -q batch <<EOF
+delete network.wan
+delete network.wan6
+set network.lan.proto='static'
+set network.lan.ipaddr='$LAN_IP'
+set network.lan.netmask='$LAN_NETMASK'
+set network.lan.gateway='$MAIN_ROUTER'
+delete network.lan.ip6assign
+delete network.lan.dns
+add_list network.lan.dns='$MAIN_ROUTER'
+set network.lan.delegate='0'
+set network.globals.packet_steering='1'
+commit network
+EOF
+
+# ---------------------------------------------------------------------------
+# 2. DHCP / DNS：默认让出 DHCP，只做 DNS
+# ---------------------------------------------------------------------------
+# 关掉 IPv6 的 RA / DHCPv6 服务端，避免和主路由抢地址下发权。
+uci -q batch <<EOF
+set dhcp.@dnsmasq[0].localise_queries='1'
+set dhcp.@dnsmasq[0].rebind_protection='0'
+set dhcp.@dnsmasq[0].domainneeded='0'
+set dhcp.@dnsmasq[0].boguspriv='0'
+set dhcp.@dnsmasq[0].filterwin2k='0'
+set dhcp.@dnsmasq[0].cachesize='4096'
+set dhcp.@dnsmasq[0].localservice='0'
+delete dhcp.lan.ra
+delete dhcp.lan.dhcpv6
+delete dhcp.lan.ra_slaac
+delete dhcp.lan.ra_flags
+set dhcp.lan.leasetime='12h'
+commit dhcp
+EOF
+
+if [ "$SERVE_DHCP" = "1" ]; then
+	log "启用旁路由 DHCP，网关/DNS 下发为 $LAN_IP"
+	uci -q batch <<EOF
+set dhcp.lan.ignore='0'
+set dhcp.lan.start='$DHCP_START'
+set dhcp.lan.limit='$DHCP_LIMIT'
+set dhcp.lan.force='1'
+delete dhcp.lan.dhcp_option
+add_list dhcp.lan.dhcp_option='3,$LAN_IP'
+add_list dhcp.lan.dhcp_option='6,$LAN_IP'
+commit dhcp
+EOF
+else
+	log "关闭旁路由 DHCP（由主路由下发）"
+	uci -q set dhcp.lan.ignore='1'
+	uci -q commit dhcp
+fi
+
+# 旁路由不需要 odhcpd（IPv6 地址下发交给主路由）
+/etc/init.d/odhcpd disable >/dev/null 2>&1
+/etc/init.d/odhcpd stop    >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# 3. 防火墙：旁路由要放行转发，且必须关掉硬件/软件流量分载
+# ---------------------------------------------------------------------------
+# flow_offloading 会让数据包绕过 netfilter，导致透明代理（Passwall/OpenClash）失效。
+LAN_ZONE="$(uci -q show firewall | grep -m1 "\.name='lan'" | cut -d. -f1-2)"
+if [ -n "$LAN_ZONE" ]; then
+	uci -q batch <<EOF
+set ${LAN_ZONE}.input='ACCEPT'
+set ${LAN_ZONE}.output='ACCEPT'
+set ${LAN_ZONE}.forward='ACCEPT'
+set ${LAN_ZONE}.masq='0'
+set ${LAN_ZONE}.mtu_fix='0'
+EOF
+fi
+uci -q batch <<EOF
+set firewall.@defaults[0].forward='ACCEPT'
+set firewall.@defaults[0].flow_offloading='0'
+set firewall.@defaults[0].flow_offloading_hw='0'
+set firewall.@defaults[0].drop_invalid='0'
+commit firewall
+EOF
+
+# 开启内核转发（旁路由必需）
+cat > /etc/sysctl.d/99-bypass-router.conf <<EOF
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv4.conf.all.route_localnet=1
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.netfilter.nf_conntrack_max=262144
+EOF
+sysctl -p /etc/sysctl.d/99-bypass-router.conf >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# 4. 系统：主机名、时区、NTP（国内源）
+# ---------------------------------------------------------------------------
+uci -q batch <<EOF
+set system.@system[0].hostname='$HOSTNAME'
+set system.@system[0].timezone='CST-8'
+set system.@system[0].zonename='Asia/Shanghai'
+set system.@system[0].log_size='128'
+delete system.ntp.server
+add_list system.ntp.server='ntp.aliyun.com'
+add_list system.ntp.server='ntp1.aliyun.com'
+add_list system.ntp.server='ntp.tencent.com'
+add_list system.ntp.server='cn.ntp.org.cn'
+set system.ntp.enabled='1'
+set system.ntp.enable_server='1'
+commit system
+EOF
+echo "$HOSTNAME" > /proc/sys/kernel/hostname 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# 5. LuCI：Argon 主题 + 中文 + 关掉 HTTPS 强制跳转（自签证书太吵）
+# ---------------------------------------------------------------------------
+[ -d /www/luci-static/argon ] && {
+	uci -q set luci.main.mediaurlbase='/luci-static/argon'
+}
+uci -q set luci.main.lang='zh_cn'
+uci -q commit luci
+
+uci -q batch <<EOF
+set uhttpd.main.redirect_https='0'
+set uhttpd.main.script_timeout='300'
+set uhttpd.main.network_timeout='300'
+commit uhttpd
+EOF
+
+# ttyd 网页终端免密进入
+[ -f /etc/config/ttyd ] && {
+	uci -q set ttyd.@ttyd[0].command='/bin/login -f root'
+	uci -q commit ttyd
+}
+
+# ---------------------------------------------------------------------------
+# 6. SmartDNS：国内直连组 + OpenDNS 境外组
+# ---------------------------------------------------------------------------
+# 链路：客户端 -> dnsmasq:53 -> smartdns:6053 -> {国内组测速优选 | OpenDNS 组}
+# auto_set_dnsmasq=1 让 smartdns 自己去接管 dnsmasq 的上游，停掉服务时会自动还原。
+if [ -f /etc/config/smartdns ]; then
+	uci -q batch <<EOF
+set smartdns.@smartdns[0].enabled='1'
+set smartdns.@smartdns[0].server_name='smartdns'
+set smartdns.@smartdns[0].port='6053'
+set smartdns.@smartdns[0].ipv6_server='1'
+set smartdns.@smartdns[0].tcp_server='1'
+set smartdns.@smartdns[0].dualstack_ip_selection='1'
+set smartdns.@smartdns[0].prefetch_domain='1'
+set smartdns.@smartdns[0].serve_expired='1'
+set smartdns.@smartdns[0].cache_size='8192'
+set smartdns.@smartdns[0].speed_check_mode='ping,tcp:443'
+set smartdns.@smartdns[0].force_https_soa='0'
+set smartdns.@smartdns[0].rr_ttl_min='60'
+set smartdns.@smartdns[0].rr_ttl_max='86400'
+set smartdns.@smartdns[0].resolve_local_hostnames='1'
+set smartdns.@smartdns[0].auto_set_dnsmasq='1'
+set smartdns.@smartdns[0].log_level='error'
+set smartdns.@smartdns[0].coredump='0'
+EOF
+
+	# 清空自带的示例上游，写入我们自己的
+	while uci -q delete smartdns.@server[0]; do :; done
+
+	# $1=地址 $2=类型(udp/tcp/tls/https) $3=端口 $4=分组 $5=排除默认组
+	sd_server() {
+		local s
+		s="$(uci add smartdns server)"
+		uci -q set "smartdns.$s.enabled=1"
+		uci -q set "smartdns.$s.ip=$1"
+		uci -q set "smartdns.$s.type=$2"
+		[ -n "$3" ] && uci -q set "smartdns.$s.port=$3"
+		[ -n "$4" ] && uci -q set "smartdns.$s.server_group=$4"
+		[ "$5" = "1" ] && uci -q set "smartdns.$s.exclude_default_group=1"
+	}
+
+	# —— 国内组（默认组，测速优选，直连可达）——
+	sd_server "223.5.5.5"        udp   53
+	sd_server "223.6.6.6"        udp   53
+	sd_server "119.29.29.29"     udp   53
+	sd_server "180.76.76.76"     udp   53
+	sd_server "https://doh.pub/dns-query"        https "" ""  ""
+	sd_server "https://dns.alidns.com/dns-query" https "" ""  ""
+
+	# —— OpenDNS 组（境外域名专用，走代理更稳）——
+	# 53 端口在部分网络会被污染，这里同时给出 5353 备用端口和加密通道。
+	sd_server "208.67.222.222"   udp   5353 opendns 1
+	sd_server "208.67.220.220"   udp   5353 opendns 1
+	sd_server "208.67.222.222"   tcp   443  opendns 1
+	sd_server "https://doh.opendns.com/dns-query" https "" opendns 1
+	sd_server "2620:119:35::35"  udp   53   opendns 1
+	sd_server "2620:119:53::53"  udp   53   opendns 1
+
+	uci -q commit smartdns
+	/etc/init.d/smartdns enable >/dev/null 2>&1
+	log "SmartDNS 已配置：默认组=国内DNS，opendns 组=OpenDNS"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Passwall：预置分流/端口/远程 DNS(OpenDNS DoH)，但默认不启用
+# ---------------------------------------------------------------------------
+# 出厂不启用是刻意的：没有节点就打开会直接把网络打断。
+# 加好节点后到「服务 -> PassWall -> 基本设置」勾选启用即可。
+if [ -f /etc/config/passwall ]; then
+	uci -q batch <<EOF
+set passwall.@global[0].enabled='0'
+set passwall.@global[0].tcp_proxy_mode='proxy'
+set passwall.@global[0].udp_proxy_mode='proxy'
+set passwall.@global[0].localhost_proxy='1'
+set passwall.@global[0].client_proxy='1'
+set passwall.@global[0].dns_shunt='dnsmasq'
+set passwall.@global[0].dns_mode='doh'
+set passwall.@global[0].remote_dns_doh='https://doh.opendns.com/dns-query,208.67.222.222'
+set passwall.@global[0].remote_dns='208.67.222.222'
+set passwall.@global[0].direct_dns_mode='udp'
+set passwall.@global[0].direct_dns='223.5.5.5'
+set passwall.@global[0].dns_redirect='1'
+set passwall.@global[0].filter_proxy_ipv6='1'
+set passwall.@global[0].use_direct_list='1'
+set passwall.@global[0].use_proxy_list='1'
+set passwall.@global[0].use_block_list='1'
+set passwall.@global[0].use_gfw_list='1'
+set passwall.@global[0].chn_list='direct'
+set passwall.@global_forwarding[0].tcp_no_redir_ports='disable'
+set passwall.@global_forwarding[0].udp_no_redir_ports='disable'
+set passwall.@global_forwarding[0].tcp_redir_ports='1:65535'
+set passwall.@global_forwarding[0].udp_redir_ports='1:65535'
+set passwall.@global_forwarding[0].tcp_proxy_way='tproxy'
+set passwall.@global_forwarding[0].ipv6_tproxy='0'
+set passwall.@global_forwarding[0].prefer_nft='1'
+commit passwall
+EOF
+	/etc/init.d/passwall disable >/dev/null 2>&1
+	log "Passwall 已预置（远程 DNS = OpenDNS DoH），默认未启用"
+fi
+
+# OpenClash 同理：预置但不自启，避免与 Passwall 抢流量
+[ -f /etc/init.d/openclash ] && /etc/init.d/openclash disable >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# 8. 收尾
+# ---------------------------------------------------------------------------
+# 无线：旁路由默认不开 AP（如需开，去「网络 -> 无线」手动启用即可）
+
+log "旁路由配置完成。管理地址 http://$LAN_IP  (root 密码为空，请立即设置！)"
+exit 0
