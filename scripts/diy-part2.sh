@@ -18,9 +18,20 @@ UCI_DEFAULT_FILE="files/etc/uci-defaults/99-bypass-router"
 # ---------------------------------------------------------------------------
 if [ -f "$UCI_DEFAULT_FILE" ]; then
 	LAN_IP="$(sed -n 's/^LAN_IP="\([^"]*\)".*/\1/p' "$UCI_DEFAULT_FILE" | head -1)"
-	if [ -n "$LAN_IP" ] && [ -f package/base-files/files/bin/config_generate ]; then
-		sed -i "s/192\.168\.1\.1/${LAN_IP}/g" package/base-files/files/bin/config_generate
-		echo "==> [diy-part2] 出厂默认 IP 已设为 ${LAN_IP}"
+	CFG_GEN="package/base-files/files/bin/config_generate"
+	# 注意：这里的 192.168.1.1 是 OpenWrt 上游写死的出厂默认地址，
+	# 和本项目选的网段无关。换网段时不要改这个数字，改上面的 LAN_IP 就行。
+	OPENWRT_DEFAULT_IP="192.168.1.1"
+	if [ -n "$LAN_IP" ] && [ -f "$CFG_GEN" ]; then
+		if grep -q "$OPENWRT_DEFAULT_IP" "$CFG_GEN"; then
+			sed -i "s/${OPENWRT_DEFAULT_IP//./\\.}/${LAN_IP}/g" "$CFG_GEN"
+			echo "==> [diy-part2] 出厂默认 IP 已设为 ${LAN_IP}"
+		else
+			# 上游改过默认值就会走到这里。不致命（uci-defaults 仍会设好 IP），
+			# 但第二道保险失效了，得让它在日志里显眼。
+			echo "::warning::config_generate 里找不到 ${OPENWRT_DEFAULT_IP}，出厂默认 IP 未修改；"
+			echo "           首次开机仍会由 uci-defaults 设为 ${LAN_IP}"
+		fi
 	fi
 else
 	echo "==> [diy-part2] 警告：找不到 $UCI_DEFAULT_FILE，跳过 IP 同步"

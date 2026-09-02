@@ -114,6 +114,7 @@ jobs:
         working-directory: /mnt/workdir/openwrt
         run: |
           cp -f "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          rm -rf ./files
           cp -rf "$GITHUB_WORKSPACE/files" ./files
           # uci-defaults 脚本必须可执行
           chmod +x files/etc/uci-defaults/* 2>/dev/null || true
@@ -170,10 +171,10 @@ jobs:
 
           | 项目 | 值 |
           | --- | --- |
-          | 管理地址 | http://192.168.1.2 |
+          | 管理地址 | http://192.168.2.2 |
           | 用户名 | `root` |
           | 密码 | **空**（首次登录后请立刻设置） |
-          | 网关 | 192.168.1.1（主路由） |
+          | 网关 | 192.168.2.1（主路由） |
           | DHCP | 已关闭（由主路由下发） |
 
           ### 选哪个文件
@@ -183,10 +184,10 @@ jobs:
           - 想以后扩容分区、装 Docker，选 `ext4` 版；想保留恢复出厂设置，选 `squashfs` 版
 
           ### 刷完之后
-          1. 电脑网口直连软路由，手动设 IP `192.168.1.100/24`，浏览器打开 http://192.168.1.2
+          1. 电脑网口直连软路由，手动设 IP `192.168.2.100/24`，浏览器打开 http://192.168.2.2
           2. 先改 root 密码
           3. 「服务 → PassWall」里加节点，然后才勾选「启用」
-          4. 客户端把网关和 DNS 都改成 `192.168.1.2` 即可走旁路由
+          4. 客户端把网关和 DNS 都改成 `192.168.2.2` 即可走旁路由
 
           NOTES
 
