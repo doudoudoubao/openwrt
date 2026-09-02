@@ -79,10 +79,15 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
 | 转发方式 | TProxy + nftables（24.10 的 firewall4 就是 nftables） |
 | 代理端口 | TCP/UDP 全端口 `1:65535` |
 | 分流列表 | 直连/代理/屏蔽/GFW 名单全开，国内 IP 直连 |
-| 内核 | Xray、Sing-Box、Hysteria、Shadowsocks-Rust、SSR、ShadowTLS、TUIC… |
+| 内核 | Xray、Sing-Box、Hysteria、SSR、Simple-Obfs、V2ray-Plugin、Xray-Plugin |
 
 **默认不启用是故意的**：没配节点就打开会直接把网络打断。加好节点后再到
 「服务 → PassWall → 基本设置」里勾选启用。
+
+> 有意去掉的三个：Shadowsocks-Rust、Shadow-TLS、TUIC。它们是本配置里仅有的 Rust 包，
+> 留着就要从源码编译整套 Rust 宿主工具链，首次构建多花约 1～1.5 小时，足以撞上 GitHub
+> Actions 的 6 小时单任务上限（第一轮构建就是这么挂的）。需要这几个协议的话，把
+> `configs/x86_64.config` 里对应的三行 `is not set` 改回 `=y` 即可，代价是构建时间。
 
 ### 其他插件
 
