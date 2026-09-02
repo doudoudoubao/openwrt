@@ -153,8 +153,22 @@ jobs:
         working-directory: /mnt/workdir/openwrt
         run: |
           echo "使用 $(nproc) 线程编译"
-          # 并行失败多半是依赖顺序问题，退回单线程；再失败就开 V=s 打详细日志
-          make -j"$(nproc)" || make -j1 || make -j1 V=s
+          # 并行失败多半是依赖顺序问题，退回单线程重试一次。
+          # 这里只重试一趟并直接开 V=s：原来的 `-j1 || -j1 V=s` 会把一次真实失败
+          # 拖成三趟完整编译（并行 + 静默单线程 + 详细单线程），最坏情况足以撞上
+          # Actions 的 6 小时上限，而且日志里看不出到底是哪一趟报的错。
+          echo "::group::并行编译 -j$(nproc)"
+          if make -j"$(nproc)"; then
+            echo "::endgroup::"
+            echo "并行编译通过"
+          else
+            echo "::endgroup::"
+            echo "::warning::并行编译失败，改用单线程 + 详细日志重试"
+            echo "::group::单线程重试 -j1 V=s"
+            make -j1 V=s
+            echo "::endgroup::"
+            echo "单线程重试通过（说明是并行依赖顺序问题，不是代码问题）"
+          fi
           echo "status=success" >> "$GITHUB_OUTPUT"
           echo "DEVICE_NAME=$(grep '^CONFIG_TARGET_BOARD' .config | cut -d'"' -f2)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"

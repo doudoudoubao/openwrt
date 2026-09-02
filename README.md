@@ -19,7 +19,8 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
      ```bash
      git tag build-$(date +%Y%m%d) && git push origin build-$(date +%Y%m%d)
      ```
-3. 等 1.5～3 小时（第一次最慢，工具链要从头编）
+3. 等 2.5～4 小时（实测首次构建约 2.5 小时以上：工具链从零编译，外加 545 个软件包，
+   其中 Rust/Go 组件特别慢；后续构建没有缓存也不会更快）
 4. 从 **Artifacts** 或 **Releases** 下载固件
 
 > 为什么要有标签这条路：GitHub 的 `workflow_dispatch` 只认默认分支上的 workflow 文件，
