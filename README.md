@@ -39,10 +39,16 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
 
 | 想要什么 | 下载哪个文件 |
 | --- | --- |
+| **ESXi** | `ByPassWrt-esxi-vmdk.tar.gz`（解压出两个文件一起上传） |
 | 物理机，2015 年后的机器 | `*-squashfs-combined-efi.img.gz`（UEFI） |
 | 物理机，老机器 / 传统 BIOS | `*-squashfs-combined.img.gz` |
-| PVE / ESXi / VirtualBox | `*.vmdk` |
-| 想以后随便扩容分区 | 选 `ext4` 版而不是 `squashfs` 版 |
+
+> ESXi 为什么要单独一个包：OpenWrt 自带的 `.vmdk` 是 `qemu-img` 默认的
+> monolithicSparse 子格式，ESXi 不认。构建时会另外用 `subformat=monolithicFlat`
+> 转一份「描述符 + flat 数据」的双文件版本，上传后可直接当"现有硬盘"挂载。
+>
+> 只出 squashfs 版（支持恢复出厂设置）。需要 ext4 就在工作流里把
+> `TARGET_ROOTFS_EXT4FS` 那行从关闭列表中去掉。
 
 刷机和接入方法见 **[docs/旁路由部署指南.md](docs/旁路由部署指南.md)**。
 

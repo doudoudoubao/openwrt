@@ -78,12 +78,20 @@ jobs:
           # 它要 cp .../root-x86/boot/. 而该目录并不存在，随后又调用 mkisofs
           # （Ubuntu 上没有这个名字）。ISO 是所有格式里最后生成的，不关掉的话
           # 前面二十多分钟生成的 img.gz / vmdk / qcow2 全部白费。
+          # ImageBuilder 默认把每种虚拟磁盘格式都产一遍，28 个文件里真正有用的没几个。
+          # 这里只留 squashfs 的 img（物理机 EFI/BIOS 各一份），VMDK 我们后面自己转
+          # ——因为 OpenWrt 用的是 `qemu-img convert -O vmdk` 不带子格式，产出的是
+          # monolithicSparse，ESXi 不认。
           IB_CFG="$PWD/imagebuilder/.config"
           if [ -f "$IB_CFG" ]; then
-            sed -i 's/^CONFIG_ISO_IMAGES=y/# CONFIG_ISO_IMAGES is not set/' "$IB_CFG"
-            echo "ISO 生成开关: $(grep -E 'ISO_IMAGES' "$IB_CFG" || echo '未出现该符号')"
+            for sym in ISO_IMAGES VMDK_IMAGES VDI_IMAGES VHDX_IMAGES QCOW2_IMAGES TARGET_ROOTFS_EXT4FS; do
+              sed -i "s/^CONFIG_${sym}=y/# CONFIG_${sym} is not set/" "$IB_CFG"
+            done
+            echo "::group::镜像格式开关"
+            grep -E '(ISO|VMDK|VDI|VHDX|QCOW2)_IMAGES|TARGET_ROOTFS_(EXT4FS|SQUASHFS)' "$IB_CFG" || true
+            echo "::endgroup::"
           else
-            echo "::warning::ImageBuilder 里没有 .config，无法关闭 ISO 生成"
+            echo "::warning::ImageBuilder 里没有 .config，无法精简镜像格式"
           fi
           # mkisofs 在 Ubuntu 上由 genisoimage 提供，但不一定有同名软链，补一个兜底
           command -v mkisofs >/dev/null 2>&1 || {
@@ -158,11 +166,42 @@ jobs:
           echo "status=success" >> "$GITHUB_OUTPUT"
           echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
 
+      - name: 生成 ESXi 可用的 VMDK
+        if: steps.build.outputs.status == 'success'
+        run: |
+          cd "$IB_DIR/bin/targets/${TARGET}/${SUBTARGET}"
+          SRC=$(ls *squashfs-combined-efi.img.gz 2>/dev/null | head -1)
+          [ -n "$SRC" ] || { echo "::error::找不到 squashfs-combined-efi 镜像"; exit 1; }
+          echo "源镜像: $SRC"
+
+          # OpenWrt 自带的 vmdk 是 qemu-img 默认的 monolithicSparse，ESXi 无法直接
+          # 挂载。改用 monolithicFlat：产出「描述符 + -flat 数据文件」两个文件，
+          # 上传到数据存储后可直接作为"现有硬盘"挂上，不需要 SSH 进 ESXi 转换。
+          gzip -dc "$SRC" > /tmp/bypass.img
+          qemu-img convert -f raw -O vmdk -o subformat=monolithicFlat \
+            /tmp/bypass.img ByPassWrt-esxi.vmdk
+
+          # ESXi 对描述符里的适配器类型敏感，统一成 lsilogic（新建虚拟机时选
+          # LSI Logic 并行 / SCSI 控制器即可对上）
+          if grep -q '^ddb.adapterType' ByPassWrt-esxi.vmdk; then
+            sed -i 's/^ddb.adapterType = .*/ddb.adapterType = "lsilogic"/' ByPassWrt-esxi.vmdk
+          else
+            echo 'ddb.adapterType = "lsilogic"' >> ByPassWrt-esxi.vmdk
+          fi
+          echo "::group::VMDK 描述符内容"; cat ByPassWrt-esxi.vmdk; echo "::endgroup::"
+
+          # flat 文件是未压缩的完整磁盘（约 1GB），打包后再上传
+          tar -czf ByPassWrt-esxi-vmdk.tar.gz ByPassWrt-esxi.vmdk ByPassWrt-esxi-flat.vmdk
+          rm -f ByPassWrt-esxi.vmdk ByPassWrt-esxi-flat.vmdk /tmp/bypass.img
+          ls -lh ByPassWrt-esxi-vmdk.tar.gz
+
       - name: 整理产物
         if: steps.build.outputs.status == 'success'
         run: |
           cd "$IB_DIR/bin/targets/${TARGET}/${SUBTARGET}"
           rm -rf packages
+          # 零件文件对用户没意义，只会让人不知道该下哪个
+          rm -f *-rootfs.img.gz *-rootfs.tar.gz *-kernel.bin *.bom.cdx.json profiles.json
           echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
           echo "产物清单："; ls -lh
 
@@ -192,10 +231,26 @@ jobs:
           | DHCP | 已关闭（由主路由下发） |
 
           ### 选哪个文件
-          - **物理机 / U 盘启动**：`*-squashfs-combined-efi.img.gz`（新机器，UEFI）
-            或 `*-squashfs-combined.img.gz`（老机器，Legacy BIOS）
-          - **PVE / ESXi / VirtualBox**：`*.vmdk`
-          - 想以后扩容分区、装 Docker，选 `ext4` 版；想保留恢复出厂设置，选 `squashfs` 版
+
+          | 用途 | 文件 |
+          | --- | --- |
+          | **ESXi** | `ByPassWrt-esxi-vmdk.tar.gz` |
+          | 物理机 / U盘（UEFI，2015年后机器） | `*-squashfs-combined-efi.img.gz` |
+          | 物理机（老机器，传统 BIOS） | `*-squashfs-combined.img.gz` |
+
+          ### ESXi 怎么装
+          1. 下载 `ByPassWrt-esxi-vmdk.tar.gz`，**本地解压**，得到两个文件：
+             `ByPassWrt-esxi.vmdk`（描述符）和 `ByPassWrt-esxi-flat.vmdk`（约 1GB 数据）
+          2. 用数据存储浏览器把**这两个文件一起**上传到同一个文件夹
+          3. 新建虚拟机 → 客户机操作系统选 **其他 / Other Linux (64 位)**
+          4. 删掉默认硬盘 → 添加 → **现有硬盘** → 选刚上传的 `ByPassWrt-esxi.vmdk`
+          5. 控制器选 **LSI Logic 并行**；网卡选 **VMXNET3**（固件已内置驱动）
+          6. 虚拟机选项 → 引导选项 → 固件选 **EFI**
+          7. 网卡接到与主路由同一个 vSwitch/端口组，开机
+
+          > 两个 vmdk 必须放在同一目录，缺一个都挂不上。
+          > 如果 ESXi 仍拒绝，SSH 进主机执行：
+          > `vmkfstools -i ByPassWrt-esxi.vmdk -d thin ByPassWrt.vmdk`
 
           ### 刷完之后
           1. 电脑网口直连软路由，手动设 IP `192.168.2.100/24`，浏览器打开 http://192.168.2.8
