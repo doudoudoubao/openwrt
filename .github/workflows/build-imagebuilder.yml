@@ -54,7 +54,7 @@ jobs:
           # create VDI/VMDK images"），白跑十分钟。
           sudo apt-get -y -qq install build-essential libncurses-dev zstd xz-utils \
                                      python3 python3-setuptools gawk wget unzip file rsync \
-                                     qemu-utils
+                                     qemu-utils genisoimage
 
       - name: 下载并解压 ImageBuilder
         run: |
@@ -72,6 +72,25 @@ jobs:
           esac
           rm -f "$IB"
           mv immortalwrt-imagebuilder-* imagebuilder
+
+          # 关掉 ISO 镜像生成。
+          # 旁路由用不到 ISO，而且 ImageBuilder 里这条路径本身是坏的：
+          # 它要 cp .../root-x86/boot/. 而该目录并不存在，随后又调用 mkisofs
+          # （Ubuntu 上没有这个名字）。ISO 是所有格式里最后生成的，不关掉的话
+          # 前面二十多分钟生成的 img.gz / vmdk / qcow2 全部白费。
+          IB_CFG="$PWD/imagebuilder/.config"
+          if [ -f "$IB_CFG" ]; then
+            sed -i 's/^CONFIG_ISO_IMAGES=y/# CONFIG_ISO_IMAGES is not set/' "$IB_CFG"
+            echo "ISO 生成开关: $(grep -E 'ISO_IMAGES' "$IB_CFG" || echo '未出现该符号')"
+          else
+            echo "::warning::ImageBuilder 里没有 .config，无法关闭 ISO 生成"
+          fi
+          # mkisofs 在 Ubuntu 上由 genisoimage 提供，但不一定有同名软链，补一个兜底
+          command -v mkisofs >/dev/null 2>&1 || {
+            sudo ln -sf "$(command -v genisoimage)" /usr/local/bin/mkisofs 2>/dev/null \
+              && echo "已建立 mkisofs -> genisoimage 软链"
+          }
+
           echo "IB_DIR=$PWD/imagebuilder" >> "$GITHUB_ENV"
           echo "PKG_BASE=https://downloads.immortalwrt.org/releases/${IB_VERSION}/packages/x86_64" >> "$GITHUB_ENV"
 
