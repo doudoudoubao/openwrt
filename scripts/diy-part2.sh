@@ -7,7 +7,7 @@ set -euo pipefail
 
 echo "==> [diy-part2] 开始源码级定制"
 
-UCI_DEFAULT_FILE="files/etc/uci-defaults/99-bypass-router"
+UCI_DEFAULT_FILE="files/etc/uci-defaults/zzz-bypass-router"
 
 # ---------------------------------------------------------------------------
 # 1. 把旁路由 IP 同步进 config_generate

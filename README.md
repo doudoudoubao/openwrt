@@ -19,9 +19,19 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
      ```bash
      git tag build-$(date +%Y%m%d) && git push origin build-$(date +%Y%m%d)
      ```
-3. 等 2.5～4 小时（实测首次构建约 2.5 小时以上：工具链从零编译，外加 545 个软件包，
-   其中 Rust/Go 组件特别慢；后续构建没有缓存也不会更快）
+3. 等十几分钟
 4. 从 **Artifacts** 或 **Releases** 下载固件
+
+> **为什么这么快**：固件是用官方 ImageBuilder 组装的，直接取 ImmortalWrt 预编译好的
+> ipk，不编译任何东西。功能和从源码编译完全一致。
+>
+> 本项目一开始走的是从源码编译，但这条路在 GitHub 免费 runner（4 核）上走不通：
+> 这套软件包组合（Rust/Go 组件 + ruby + 171 个内核模块）连续两次都在 **360 分钟整**
+> 被 Actions 的单任务 6 小时上限强制终止，一个固件都没产出。缓存也救不了——
+> `staging_dir` + `build_dir` 有 20～30 GB，远超 GitHub 10 GB 的缓存上限。
+>
+> 源码编译的工作流仍保留在 `build-openwrt.yml`，但只能手动触发，且需要自备
+> self-hosted runner。只有要改内核配置、或要用官方仓库里没有的包时才需要它。
 
 > 为什么要有标签这条路：GitHub 的 `workflow_dispatch` 只认默认分支上的 workflow 文件，
 > 分支上的它压根不显示。而 `push` 事件用的是被推送 ref 自带的 workflow，所以在分支合进
@@ -44,13 +54,13 @@ DNS 分流链路、PassWall 的分流与远程 DNS，刷完开机就是能用的
 
 | 项 | 默认值 | 说明 |
 | --- | --- | --- |
-| 本机地址 | `192.168.2.2` | 与主路由同网段 |
+| 本机地址 | `192.168.2.8` | 与主路由同网段 |
 | 网关 | `192.168.2.1` | 指向主路由 |
 | DHCP 服务 | **关闭** | 避免和主路由抢着发地址 |
 | WAN 口 | **已删除** | 单臂旁路由不需要 |
 | 所有物理网口 | 全并入 `br-lan` | 单网口、多网口机器都能插哪个口都通 |
 | 硬件/软件流量分载 | **关闭** | 开着会让数据包绕过 netfilter，透明代理直接失效 |
-| BBR + fq | 已开启 | 见 `/etc/sysctl.d/99-bypass-router.conf` |
+| BBR + fq | 已开启 | 见 `/etc/sysctl.d/zzz-bypass-router.conf` |
 
 ### DNS 链路
 
@@ -104,10 +114,10 @@ Broadcom、Mellanox，以及 ESXi / PVE / Hyper-V / VirtualBox 的虚拟网卡�
 
 ### 改 IP / 主机名 / 要不要接管 DHCP
 
-只有一处需要改：[`files/etc/uci-defaults/99-bypass-router`](files/etc/uci-defaults/99-bypass-router) 顶部。
+只有一处需要改：[`files/etc/uci-defaults/zzz-bypass-router`](files/etc/uci-defaults/zzz-bypass-router) 顶部。
 
 ```sh
-LAN_IP="192.168.2.2"        # 旁路由自己的 IP
+LAN_IP="192.168.2.8"        # 旁路由自己的 IP
 MAIN_ROUTER="192.168.2.1"   # 主路由 IP
 HOSTNAME="ByPassWrt"
 SERVE_DHCP="0"              # 改成 1 = 旁路由接管 DHCP，客户端自动指向旁路由
@@ -139,18 +149,29 @@ SERVE_DHCP="0"              # 改成 1 = 旁路由接管 DHCP，客户端自动�
 ## 仓库结构
 
 ```
-.github/workflows/build-openwrt.yml   构建工作流（手动触发，可选开启每周自动构建）
-configs/x86_64.config                 种子配置：目标平台 + 插件清单
-scripts/diy-part1.sh                  拉完源码、update feeds 之前执行（挂第三方 feed）
-scripts/diy-part2.sh                  feeds 装完、defconfig 之前执行（同步 IP、覆盖安装）
-scripts/check-config.sh               核对哪些包被 defconfig 丢弃了
-scripts/depends-ubuntu.txt            Ubuntu 22.04 编译依赖清单
-files/                                原样打包进固件的文件
-  etc/uci-defaults/99-bypass-router     首次开机自动执行的旁路由配置脚本
-  etc/smartdns/custom.conf              SmartDNS 分流规则（OpenDNS 分组）
-  etc/profile.d/99-bypass-tips.sh       SSH 登录提示
-docs/旁路由部署指南.md                  刷机、接入、排障
+.github/workflows/
+  build-imagebuilder.yml    ← 日常用这个：ImageBuilder 组装，十几分钟
+  build-openwrt.yml            从源码编译，仅手动触发，需 self-hosted runner
+configs/
+  x86_64.packages           ← ImageBuilder 的软件包清单（由下面的脚本生成）
+  x86_64.config                源码编译用的种子配置
+scripts/
+  gen-packages.sh           ← 从 .config 生成 packages 清单，并过滤掉编译期子选项
+  diy-part1.sh                 源码编译：挂第三方 feed
+  diy-part2.sh                 源码编译：同步 IP、覆盖安装
+  check-config.sh              源码编译：核对被 defconfig 丢弃的包
+  depends-ubuntu.txt           源码编译依赖清单
+files/                      原样打包进固件的文件（两种构建方式共用）
+  etc/uci-defaults/zzz-bypass-router     首次开机自动执行的旁路由配置脚本
+  etc/smartdns/custom.conf               SmartDNS 分流规则（OpenDNS 分组）
+  etc/profile.d/99-bypass-tips.sh        SSH 登录提示
+docs/旁路由部署指南.md        刷机、接入、排障
 ```
+
+> `files/etc/uci-defaults/` 里的脚本**必须**以 `zzz-` 开头。OpenWrt 按 `ls` 顺序执行
+> 这个目录，C locale 下数字排在字母前面；而 PassWall 的初始化脚本叫 `luci-passwall`，
+> 它才负责生成 `/etc/config/passwall`。用 `99-` 前缀会抢在它前面跑，那时配置文件还不
+> 存在，整段 PassWall 预置会被静默跳过。
 
 ## 安全提醒
 

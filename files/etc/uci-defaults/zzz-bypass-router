@@ -2,12 +2,18 @@
 #
 # 旁路由（单臂路由）一键配置
 # 首次启动时自动执行一次，成功后本文件会被系统自动删除。
+#
+# 文件名必须以 zzz- 开头，不要改成 99- 之类的数字前缀：
+# OpenWrt 的 /etc/init.d/boot 按 `ls` 顺序执行 /etc/uci-defaults/*，C locale 下
+# 数字排在字母之前。而 PassWall 自己的初始化脚本叫 luci-passwall，它才负责把
+# /etc/config/passwall 从模板复制出来。若本脚本用 99- 前缀就会抢在它前面运行，
+# 那时 /etc/config/passwall 尚不存在，整段 PassWall 配置会被静默跳过。
 # 执行日志：/tmp/bypass-setup.log
 #
 # ===========================================================================
 #  用户可修改区 —— 改完重新编译即可；已刷机的也可直接改 /etc/config/* 生效
 # ===========================================================================
-LAN_IP="192.168.2.2"           # 旁路由自己的 IP（与主路由同网段，且不能冲突）
+LAN_IP="192.168.2.8"           # 旁路由自己的 IP（与主路由同网段，且不能冲突）
 LAN_NETMASK="255.255.255.0"
 MAIN_ROUTER="192.168.2.1"      # 主路由 IP，也就是旁路由的网关和出口
 HOSTNAME="ByPassWrt"           # 主机名
@@ -245,7 +251,16 @@ fi
 # ---------------------------------------------------------------------------
 # 出厂不启用是刻意的：没有节点就打开会直接把网络打断。
 # 加好节点后到「服务 -> PassWall -> 基本设置」勾选启用即可。
-if [ -f /etc/config/passwall ]; then
+#
+# DNS 组合说明（这几个值是对着 luci-app-passwall 源码核过的）：
+#   dns_shunt=dnsmasq        分流交给 dnsmasq
+#   dns_mode=sing-box        用 Sing-Box 自带 DNS 解析境外域名
+#                            （合法值只有 udp/tcp/dns2socks/sing-box/xray，没有 doh）
+#   v2ray_dns_mode=doh       Sing-Box 的请求协议选 DoH
+#   remote_dns_doh=...       OpenDNS 的 DoH 地址，用纯 IP 形式免去 bootstrap 解析
+if [ ! -f /etc/config/passwall ]; then
+	log "警告：/etc/config/passwall 不存在，PassWall 预置被跳过（检查 uci-defaults 执行顺序）"
+else
 	uci -q batch <<EOF
 set passwall.@global[0].enabled='0'
 set passwall.@global[0].tcp_proxy_mode='proxy'
@@ -253,8 +268,9 @@ set passwall.@global[0].udp_proxy_mode='proxy'
 set passwall.@global[0].localhost_proxy='1'
 set passwall.@global[0].client_proxy='1'
 set passwall.@global[0].dns_shunt='dnsmasq'
-set passwall.@global[0].dns_mode='doh'
-set passwall.@global[0].remote_dns_doh='https://doh.opendns.com/dns-query,208.67.222.222'
+set passwall.@global[0].dns_mode='sing-box'
+set passwall.@global[0].v2ray_dns_mode='doh'
+set passwall.@global[0].remote_dns_doh='https://208.67.222.222/dns-query'
 set passwall.@global[0].remote_dns='208.67.222.222'
 set passwall.@global[0].direct_dns_mode='udp'
 set passwall.@global[0].direct_dns='223.5.5.5'

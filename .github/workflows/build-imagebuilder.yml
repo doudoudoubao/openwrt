@@ -1,0 +1,195 @@
+name: 构建旁路由固件
+
+# 用官方 ImageBuilder 组装固件：不编译任何东西，十几分钟出货。
+#
+# 为什么不从源码编译：本项目的软件包组合（Rust/Go 组件 + ruby + 171 个内核模块）
+# 在 GitHub 免费 runner（4 核）上单次全量编译超过 6 小时，会被 Actions 的单任务
+# 上限强制终止——实测连续两次都卡在 360 分钟整。ImageBuilder 用官方预编译的 ipk
+# 组装，功能完全一致，代价是不能改内核配置（本项目也不需要）。
+on:
+  workflow_dispatch:
+    inputs:
+      ib_version:
+        description: 'ImmortalWrt 版本'
+        required: true
+        default: '24.10.5'
+        type: string
+      create_release:
+        description: '发布到 Release'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches: ['build/**', 'claude/build-*']
+    tags: ['build-*']
+
+env:
+  IB_VERSION: ${{ inputs.ib_version || '24.10.5' }}
+  TARGET: x86
+  SUBTARGET: '64'
+  PROFILE: generic
+  ROOTFS_PARTSIZE: '1024'
+  TZ: Asia/Shanghai
+
+concurrency:
+  group: build-openwrt
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -y -qq install build-essential libncurses-dev zstd xz-utils \
+                                     python3 python3-setuptools gawk wget unzip file rsync
+
+      - name: 下载并解压 ImageBuilder
+        run: |
+          BASE="https://downloads.immortalwrt.org/releases/${IB_VERSION}/targets/${TARGET}/${SUBTARGET}"
+          echo "仓库: $BASE"
+          # 文件名里带完整版本号，且 24.10 起用 .tar.zst；从目录索引里取而不是写死
+          IB=$(curl -fsSL --retry 4 --retry-delay 3 "$BASE/" \
+               | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -1)
+          [ -n "$IB" ] || { echo "::error::目录索引里找不到 ImageBuilder，检查版本号 ${IB_VERSION}"; exit 1; }
+          echo "文件: $IB"
+          curl -fsSL --retry 4 --retry-delay 3 -O "$BASE/$IB"
+          case "$IB" in
+            *.tar.zst) tar --zstd -xf "$IB" ;;
+            *.tar.xz)  tar -xJf "$IB" ;;
+          esac
+          rm -f "$IB"
+          mv immortalwrt-imagebuilder-* imagebuilder
+          echo "IB_DIR=$PWD/imagebuilder" >> "$GITHUB_ENV"
+          echo "PKG_BASE=https://downloads.immortalwrt.org/releases/${IB_VERSION}/packages/x86_64" >> "$GITHUB_ENV"
+
+      - name: 校验软件包清单（防止 Package not found 让整个构建失败）
+        run: |
+          # 把官方仓库各 feed 的 Packages 索引拉下来，得到"真实存在的包"全集。
+          # 清单里若有仓库中不存在的包，make image 会直接失败；这里提前剔除并报出来，
+          # 少一两个插件也好过整个固件构建不出来。
+          : > /tmp/available.txt
+          for feed in base luci packages routing telephony; do
+            curl -fsSL --retry 3 "${PKG_BASE}/${feed}/Packages" 2>/dev/null \
+              | awk '/^Package: /{print $2}' >> /tmp/available.txt || echo "  (feed $feed 拉取失败，跳过)"
+          done
+          # 目标专属包（kmod 等）在 target 目录下
+          curl -fsSL --retry 3 \
+            "https://downloads.immortalwrt.org/releases/${IB_VERSION}/targets/${TARGET}/${SUBTARGET}/packages/Packages" \
+            2>/dev/null | awk '/^Package: /{print $2}' >> /tmp/available.txt || true
+          sort -u /tmp/available.txt -o /tmp/available.txt
+          echo "仓库中可用包总数: $(wc -l < /tmp/available.txt)"
+
+          : > /tmp/pkgs.txt; : > /tmp/missing.txt
+          while read -r p; do
+            case "$p" in ''|\#*) continue ;; esac
+            if [ "${p#-}" != "$p" ]; then echo "$p" >> /tmp/pkgs.txt; continue; fi   # '-name' 移除项直接保留
+            if grep -qxF "$p" /tmp/available.txt; then echo "$p" >> /tmp/pkgs.txt
+            else echo "$p" >> /tmp/missing.txt; fi
+          done < configs/x86_64.packages
+
+          echo "::group::清单校验结果"
+          echo "  将安装: $(wc -l < /tmp/pkgs.txt) 个"
+          if [ -s /tmp/missing.txt ]; then
+            echo "  仓库中不存在、已剔除: $(wc -l < /tmp/missing.txt) 个"
+            sed 's/^/    - /' /tmp/missing.txt
+          else
+            echo "  全部存在"
+          fi
+          echo "::endgroup::"
+
+          if [ -s /tmp/missing.txt ]; then
+            echo "::warning::有 $(wc -l < /tmp/missing.txt) 个包不在官方仓库中，已从清单剔除，对应功能不会出现在固件里"
+          fi
+          # 关键插件缺失则直接失败——固件出来了但没有代理插件毫无意义
+          for must in luci-app-passwall luci-app-smartdns dnsmasq-full luci; do
+            grep -qxF "$must" /tmp/pkgs.txt || { echo "::error::关键包缺失: $must"; exit 1; }
+          done
+          tr '\n' ' ' < /tmp/pkgs.txt > /tmp/pkgs.line
+          echo "PKGS_FILE=/tmp/pkgs.line" >> "$GITHUB_ENV"
+
+      - name: 组装固件
+        id: build
+        working-directory: ./imagebuilder
+        run: |
+          cp -r "$GITHUB_WORKSPACE/files" ./files
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          echo "::group::将写入固件的自定义文件"
+          find files -type f | sed 's/^/  /'
+          echo "::endgroup::"
+
+          make image \
+            PROFILE="$PROFILE" \
+            PACKAGES="$(cat "$PKGS_FILE")" \
+            FILES="$PWD/files" \
+            ROOTFS_PARTSIZE="$ROOTFS_PARTSIZE"
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
+
+      - name: 整理产物
+        if: steps.build.outputs.status == 'success'
+        run: |
+          cd "$IB_DIR/bin/targets/${TARGET}/${SUBTARGET}"
+          rm -rf packages
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo "产物清单："; ls -lh
+
+      - name: 上传固件到 Artifacts
+        if: steps.build.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ByPassWrt-x86_64-${{ env.BUILD_DATE }}
+          path: ${{ env.FIRMWARE }}
+          retention-days: 30
+
+      - name: 发布 Release
+        if: steps.build.outputs.status == 'success' && (inputs.create_release || github.event_name == 'push')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${BUILD_DATE}"
+          cat > /tmp/notes.md <<'NOTES'
+          ## 旁路由定制固件
+
+          | 项目 | 值 |
+          | --- | --- |
+          | 管理地址 | http://192.168.2.8 |
+          | 用户名 | `root` |
+          | 密码 | **空**（首次登录后请立刻设置） |
+          | 网关 | 192.168.2.1（主路由） |
+          | DHCP | 已关闭（由主路由下发） |
+
+          ### 选哪个文件
+          - **物理机 / U 盘启动**：`*-squashfs-combined-efi.img.gz`（新机器，UEFI）
+            或 `*-squashfs-combined.img.gz`（老机器，Legacy BIOS）
+          - **PVE / ESXi / VirtualBox**：`*.vmdk`
+          - 想以后扩容分区、装 Docker，选 `ext4` 版；想保留恢复出厂设置，选 `squashfs` 版
+
+          ### 刷完之后
+          1. 电脑网口直连软路由，手动设 IP `192.168.2.100/24`，浏览器打开 http://192.168.2.8
+          2. 先改 root 密码
+          3. 「服务 → PassWall」里加节点，然后才勾选「启用」
+          4. 客户端把网关和 DNS 都改成 `192.168.2.8` 即可走旁路由
+          NOTES
+          {
+            echo ""
+            echo "基于 ImmortalWrt ${IB_VERSION} ImageBuilder 组装。"
+            echo ""
+            echo "完整说明见 [部署指南](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/%E6%97%81%E8%B7%AF%E7%94%B1%E9%83%A8%E7%BD%B2%E6%8C%87%E5%8D%97.md)"
+          } >> /tmp/notes.md
+
+          cd "$FIRMWARE"
+          mapfile -t ASSETS < <(find . -maxdepth 1 -type f -printf '%p\n')
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "::error::没有产物文件"; exit 1; }
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "ByPassWrt ${BUILD_DATE}" --notes-file /tmp/notes.md \
+            "${ASSETS[@]}" || echo "::warning::Release 创建失败，固件仍可从 Artifacts 下载"
