@@ -125,7 +125,7 @@ luci-lib-ipkg
 luci-lib-jsonc
 luci-mod-dashboard
 luci-proto-wireguard
-luci-ssl
+luci-ssl-openssl
 luci-theme-argon
 luci-theme-bootstrap
 microsocks
