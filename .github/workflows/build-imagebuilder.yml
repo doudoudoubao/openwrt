@@ -177,7 +177,22 @@ jobs:
           # OpenWrt 自带的 vmdk 是 qemu-img 默认的 monolithicSparse，ESXi 无法直接
           # 挂载。改用 monolithicFlat：产出「描述符 + -flat 数据文件」两个文件，
           # 上传到数据存储后可直接作为"现有硬盘"挂上，不需要 SSH 进 ESXi 转换。
+          # OpenWrt 的 img.gz 尾部常带填充数据，gzip 会报 "trailing garbage ignored"
+          # 并返回退出码 2。那是警告不是错误（同一行里写着 decompression OK），
+          # 但 Actions 的 set -e 会把它当失败中止，所以这里按退出码分类处理。
+          set +e
           gzip -dc "$SRC" > /tmp/bypass.img
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::解压 $SRC 失败 (exit $rc)"; exit 1
+          fi
+          [ "$rc" -eq 2 ] && echo "gzip 报了尾部填充数据警告，解压内容正常，继续"
+          # 再确认一次解压结果确实是个像样的镜像，而不是空文件或截断
+          SZ=$(stat -c%s /tmp/bypass.img)
+          echo "解压后大小: $((SZ/1048576)) MB"
+          [ "$SZ" -gt 104857600 ] || { echo "::error::解压结果只有 $SZ 字节，不像完整镜像"; exit 1; }
+
           qemu-img convert -f raw -O vmdk -o subformat=monolithicFlat \
             /tmp/bypass.img ByPassWrt-esxi.vmdk
 
