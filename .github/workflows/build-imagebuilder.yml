@@ -1,0 +1,288 @@
+name: 构建旁路由固件
+
+# 用官方 ImageBuilder 组装固件：不编译任何东西，十几分钟出货。
+#
+# 为什么不从源码编译：本项目的软件包组合（Rust/Go 组件 + ruby + 171 个内核模块）
+# 在 GitHub 免费 runner（4 核）上单次全量编译超过 6 小时，会被 Actions 的单任务
+# 上限强制终止——实测连续两次都卡在 360 分钟整。ImageBuilder 用官方预编译的 ipk
+# 组装，功能完全一致，代价是不能改内核配置（本项目也不需要）。
+on:
+  workflow_dispatch:
+    inputs:
+      ib_version:
+        description: 'ImmortalWrt 版本'
+        required: true
+        default: '24.10.5'
+        type: string
+      create_release:
+        description: '发布到 Release'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches: ['build/**', 'claude/build-*']
+    tags: ['build-*']
+
+env:
+  IB_VERSION: ${{ inputs.ib_version || '24.10.5' }}
+  TARGET: x86
+  SUBTARGET: '64'
+  PROFILE: generic
+  ROOTFS_PARTSIZE: '1024'
+  TZ: Asia/Shanghai
+
+concurrency:
+  group: build-openwrt
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get -qq update
+          # qemu-utils 提供 qemu-img：x86 目标最后一步要生成 qcow2/vmdk/vdi，
+          # 缺了它 make image 会在所有包都装完之后才失败（"Install qemu-img to
+          # create VDI/VMDK images"），白跑十分钟。
+          sudo apt-get -y -qq install build-essential libncurses-dev zstd xz-utils \
+                                     python3 python3-setuptools gawk wget unzip file rsync \
+                                     qemu-utils genisoimage
+
+      - name: 下载并解压 ImageBuilder
+        run: |
+          BASE="https://downloads.immortalwrt.org/releases/${IB_VERSION}/targets/${TARGET}/${SUBTARGET}"
+          echo "仓库: $BASE"
+          # 文件名里带完整版本号，且 24.10 起用 .tar.zst；从目录索引里取而不是写死
+          IB=$(curl -fsSL --retry 4 --retry-delay 3 "$BASE/" \
+               | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -1)
+          [ -n "$IB" ] || { echo "::error::目录索引里找不到 ImageBuilder，检查版本号 ${IB_VERSION}"; exit 1; }
+          echo "文件: $IB"
+          curl -fsSL --retry 4 --retry-delay 3 -O "$BASE/$IB"
+          case "$IB" in
+            *.tar.zst) tar --zstd -xf "$IB" ;;
+            *.tar.xz)  tar -xJf "$IB" ;;
+          esac
+          rm -f "$IB"
+          mv immortalwrt-imagebuilder-* imagebuilder
+
+          # 关掉 ISO 镜像生成。
+          # 旁路由用不到 ISO，而且 ImageBuilder 里这条路径本身是坏的：
+          # 它要 cp .../root-x86/boot/. 而该目录并不存在，随后又调用 mkisofs
+          # （Ubuntu 上没有这个名字）。ISO 是所有格式里最后生成的，不关掉的话
+          # 前面二十多分钟生成的 img.gz / vmdk / qcow2 全部白费。
+          # ImageBuilder 默认把每种虚拟磁盘格式都产一遍，28 个文件里真正有用的没几个。
+          # 这里只留 squashfs 的 img（物理机 EFI/BIOS 各一份），VMDK 我们后面自己转
+          # ——因为 OpenWrt 用的是 `qemu-img convert -O vmdk` 不带子格式，产出的是
+          # monolithicSparse，ESXi 不认。
+          IB_CFG="$PWD/imagebuilder/.config"
+          if [ -f "$IB_CFG" ]; then
+            for sym in ISO_IMAGES VMDK_IMAGES VDI_IMAGES VHDX_IMAGES QCOW2_IMAGES TARGET_ROOTFS_EXT4FS; do
+              sed -i "s/^CONFIG_${sym}=y/# CONFIG_${sym} is not set/" "$IB_CFG"
+            done
+            echo "::group::镜像格式开关"
+            grep -E '(ISO|VMDK|VDI|VHDX|QCOW2)_IMAGES|TARGET_ROOTFS_(EXT4FS|SQUASHFS)' "$IB_CFG" || true
+            echo "::endgroup::"
+          else
+            echo "::warning::ImageBuilder 里没有 .config，无法精简镜像格式"
+          fi
+          # mkisofs 在 Ubuntu 上由 genisoimage 提供，但不一定有同名软链，补一个兜底
+          command -v mkisofs >/dev/null 2>&1 || {
+            sudo ln -sf "$(command -v genisoimage)" /usr/local/bin/mkisofs 2>/dev/null \
+              && echo "已建立 mkisofs -> genisoimage 软链"
+          }
+
+          echo "IB_DIR=$PWD/imagebuilder" >> "$GITHUB_ENV"
+          echo "PKG_BASE=https://downloads.immortalwrt.org/releases/${IB_VERSION}/packages/x86_64" >> "$GITHUB_ENV"
+
+      - name: 校验软件包清单（防止 Package not found 让整个构建失败）
+        run: |
+          # 把官方仓库各 feed 的 Packages 索引拉下来，得到"真实存在的包"全集。
+          # 清单里若有仓库中不存在的包，make image 会直接失败；这里提前剔除并报出来，
+          # 少一两个插件也好过整个固件构建不出来。
+          : > /tmp/available.txt
+          for feed in base luci packages routing telephony; do
+            curl -fsSL --retry 3 "${PKG_BASE}/${feed}/Packages" 2>/dev/null \
+              | awk '/^Package: /{print $2}' >> /tmp/available.txt || echo "  (feed $feed 拉取失败，跳过)"
+          done
+          # 目标专属包（kmod 等）在 target 目录下
+          curl -fsSL --retry 3 \
+            "https://downloads.immortalwrt.org/releases/${IB_VERSION}/targets/${TARGET}/${SUBTARGET}/packages/Packages" \
+            2>/dev/null | awk '/^Package: /{print $2}' >> /tmp/available.txt || true
+          sort -u /tmp/available.txt -o /tmp/available.txt
+          echo "仓库中可用包总数: $(wc -l < /tmp/available.txt)"
+
+          : > /tmp/pkgs.txt; : > /tmp/missing.txt
+          while read -r p; do
+            case "$p" in ''|\#*) continue ;; esac
+            if [ "${p#-}" != "$p" ]; then echo "$p" >> /tmp/pkgs.txt; continue; fi   # '-name' 移除项直接保留
+            if grep -qxF "$p" /tmp/available.txt; then echo "$p" >> /tmp/pkgs.txt
+            else echo "$p" >> /tmp/missing.txt; fi
+          done < configs/x86_64.packages
+
+          echo "::group::清单校验结果"
+          echo "  将安装: $(wc -l < /tmp/pkgs.txt) 个"
+          if [ -s /tmp/missing.txt ]; then
+            echo "  仓库中不存在、已剔除: $(wc -l < /tmp/missing.txt) 个"
+            sed 's/^/    - /' /tmp/missing.txt
+          else
+            echo "  全部存在"
+          fi
+          echo "::endgroup::"
+
+          if [ -s /tmp/missing.txt ]; then
+            echo "::warning::有 $(wc -l < /tmp/missing.txt) 个包不在官方仓库中，已从清单剔除，对应功能不会出现在固件里"
+          fi
+          # 关键插件缺失则直接失败——固件出来了但没有代理插件毫无意义
+          for must in luci-app-passwall luci-app-smartdns dnsmasq-full luci; do
+            grep -qxF "$must" /tmp/pkgs.txt || { echo "::error::关键包缺失: $must"; exit 1; }
+          done
+          tr '\n' ' ' < /tmp/pkgs.txt > /tmp/pkgs.line
+          echo "PKGS_FILE=/tmp/pkgs.line" >> "$GITHUB_ENV"
+
+      - name: 组装固件
+        id: build
+        working-directory: ./imagebuilder
+        run: |
+          cp -r "$GITHUB_WORKSPACE/files" ./files
+          chmod +x files/etc/uci-defaults/* 2>/dev/null || true
+          echo "::group::将写入固件的自定义文件"
+          find files -type f | sed 's/^/  /'
+          echo "::endgroup::"
+
+          make image \
+            PROFILE="$PROFILE" \
+            PACKAGES="$(cat "$PKGS_FILE")" \
+            FILES="$PWD/files" \
+            ROOTFS_PARTSIZE="$ROOTFS_PARTSIZE"
+
+          echo "status=success" >> "$GITHUB_OUTPUT"
+          echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_ENV"
+
+      - name: 生成 ESXi 可用的 VMDK
+        if: steps.build.outputs.status == 'success'
+        run: |
+          cd "$IB_DIR/bin/targets/${TARGET}/${SUBTARGET}"
+          SRC=$(ls *squashfs-combined-efi.img.gz 2>/dev/null | head -1)
+          [ -n "$SRC" ] || { echo "::error::找不到 squashfs-combined-efi 镜像"; exit 1; }
+          echo "源镜像: $SRC"
+
+          # OpenWrt 自带的 vmdk 是 qemu-img 默认的 monolithicSparse，ESXi 无法直接
+          # 挂载。改用 monolithicFlat：产出「描述符 + -flat 数据文件」两个文件，
+          # 上传到数据存储后可直接作为"现有硬盘"挂上，不需要 SSH 进 ESXi 转换。
+          # OpenWrt 的 img.gz 尾部常带填充数据，gzip 会报 "trailing garbage ignored"
+          # 并返回退出码 2。那是警告不是错误（同一行里写着 decompression OK），
+          # 但 Actions 的 set -e 会把它当失败中止，所以这里按退出码分类处理。
+          set +e
+          gzip -dc "$SRC" > /tmp/bypass.img
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::解压 $SRC 失败 (exit $rc)"; exit 1
+          fi
+          [ "$rc" -eq 2 ] && echo "gzip 报了尾部填充数据警告，解压内容正常，继续"
+          # 再确认一次解压结果确实是个像样的镜像，而不是空文件或截断
+          SZ=$(stat -c%s /tmp/bypass.img)
+          echo "解压后大小: $((SZ/1048576)) MB"
+          [ "$SZ" -gt 104857600 ] || { echo "::error::解压结果只有 $SZ 字节，不像完整镜像"; exit 1; }
+
+          qemu-img convert -f raw -O vmdk -o subformat=monolithicFlat \
+            /tmp/bypass.img ByPassWrt-esxi.vmdk
+
+          # ESXi 对描述符里的适配器类型敏感，统一成 lsilogic（新建虚拟机时选
+          # LSI Logic 并行 / SCSI 控制器即可对上）
+          if grep -q '^ddb.adapterType' ByPassWrt-esxi.vmdk; then
+            sed -i 's/^ddb.adapterType = .*/ddb.adapterType = "lsilogic"/' ByPassWrt-esxi.vmdk
+          else
+            echo 'ddb.adapterType = "lsilogic"' >> ByPassWrt-esxi.vmdk
+          fi
+          echo "::group::VMDK 描述符内容"; cat ByPassWrt-esxi.vmdk; echo "::endgroup::"
+
+          # flat 文件是未压缩的完整磁盘（约 1GB），打包后再上传
+          tar -czf ByPassWrt-esxi-vmdk.tar.gz ByPassWrt-esxi.vmdk ByPassWrt-esxi-flat.vmdk
+          rm -f ByPassWrt-esxi.vmdk ByPassWrt-esxi-flat.vmdk /tmp/bypass.img
+          ls -lh ByPassWrt-esxi-vmdk.tar.gz
+
+      - name: 整理产物
+        if: steps.build.outputs.status == 'success'
+        run: |
+          cd "$IB_DIR/bin/targets/${TARGET}/${SUBTARGET}"
+          rm -rf packages
+          # 零件文件对用户没意义，只会让人不知道该下哪个
+          rm -f *-rootfs.img.gz *-rootfs.tar.gz *-kernel.bin *.bom.cdx.json profiles.json
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo "产物清单："; ls -lh
+
+      - name: 上传固件到 Artifacts
+        if: steps.build.outputs.status == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ByPassWrt-x86_64-${{ env.BUILD_DATE }}
+          path: ${{ env.FIRMWARE }}
+          retention-days: 30
+
+      - name: 发布 Release
+        if: steps.build.outputs.status == 'success' && (inputs.create_release || github.event_name == 'push')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${BUILD_DATE}"
+          cat > /tmp/notes.md <<'NOTES'
+          ## 旁路由定制固件
+
+          | 项目 | 值 |
+          | --- | --- |
+          | 管理地址 | http://192.168.2.8 |
+          | 用户名 | `root` |
+          | 密码 | **空**（首次登录后请立刻设置） |
+          | 网关 | 192.168.2.1（主路由） |
+          | DHCP | 已关闭（由主路由下发） |
+
+          ### 选哪个文件
+
+          | 用途 | 文件 |
+          | --- | --- |
+          | **ESXi** | `ByPassWrt-esxi-vmdk.tar.gz` |
+          | 物理机 / U盘（UEFI，2015年后机器） | `*-squashfs-combined-efi.img.gz` |
+          | 物理机（老机器，传统 BIOS） | `*-squashfs-combined.img.gz` |
+
+          ### ESXi 怎么装
+          1. 下载 `ByPassWrt-esxi-vmdk.tar.gz`，**本地解压**，得到两个文件：
+             `ByPassWrt-esxi.vmdk`（描述符）和 `ByPassWrt-esxi-flat.vmdk`（约 1GB 数据）
+          2. 用数据存储浏览器把**这两个文件一起**上传到同一个文件夹
+          3. 新建虚拟机 → 客户机操作系统选 **其他 / Other Linux (64 位)**
+          4. 删掉默认硬盘 → 添加 → **现有硬盘** → 选刚上传的 `ByPassWrt-esxi.vmdk`
+          5. 控制器选 **LSI Logic 并行**；网卡选 **VMXNET3**（固件已内置驱动）
+          6. 虚拟机选项 → 引导选项 → 固件选 **EFI**
+          7. 网卡接到与主路由同一个 vSwitch/端口组，开机
+
+          > 两个 vmdk 必须放在同一目录，缺一个都挂不上。
+          > 如果 ESXi 仍拒绝，SSH 进主机执行：
+          > `vmkfstools -i ByPassWrt-esxi.vmdk -d thin ByPassWrt.vmdk`
+
+          ### 刷完之后
+          1. 电脑网口直连软路由，手动设 IP `192.168.2.100/24`，浏览器打开 http://192.168.2.8
+          2. 先改 root 密码
+          3. 「服务 → PassWall」里加节点，然后才勾选「启用」
+          4. 客户端把网关和 DNS 都改成 `192.168.2.8` 即可走旁路由
+          NOTES
+          {
+            echo ""
+            echo "基于 ImmortalWrt ${IB_VERSION} ImageBuilder 组装。"
+            echo ""
+            echo "完整说明见 [部署指南](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/%E6%97%81%E8%B7%AF%E7%94%B1%E9%83%A8%E7%BD%B2%E6%8C%87%E5%8D%97.md)"
+          } >> /tmp/notes.md
+
+          cd "$FIRMWARE"
+          mapfile -t ASSETS < <(find . -maxdepth 1 -type f -printf '%p\n')
+          [ "${#ASSETS[@]}" -gt 0 ] || { echo "::error::没有产物文件"; exit 1; }
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "ByPassWrt ${BUILD_DATE}" --notes-file /tmp/notes.md \
+            "${ASSETS[@]}" || echo "::warning::Release 创建失败，固件仍可从 Artifacts 下载"
