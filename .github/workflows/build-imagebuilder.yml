@@ -1,4 +1,4 @@
-name: 构建旁路由固件
+name: 构建旁路由固件 (ImageBuilder 快速版)
 
 # 用官方 ImageBuilder 组装固件：不编译任何东西，十几分钟出货。
 #
